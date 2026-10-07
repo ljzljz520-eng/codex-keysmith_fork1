@@ -844,6 +844,18 @@ __version__ = "0.6.0"
 VERSION = __version__
 MANIFEST_SCHEMA_VERSION = 1
 MANIFEST_FILENAME = ".codex-keysmith-manifest.json"
+MODEL_INSTRUCTIONS_KEY = "model_instructions_file"
+EXPERIMENTAL_INSTRUCTIONS_KEY = "experimental_instructions_file"
+INLINE_INSTRUCTIONS_KEY = "instructions"
+DEVELOPER_INSTRUCTIONS_KEY = "developer_instructions"
+KNOWN_INSTRUCTION_CONFIG_KEYS = (
+    MODEL_INSTRUCTIONS_KEY,
+    EXPERIMENTAL_INSTRUCTIONS_KEY,
+    INLINE_INSTRUCTIONS_KEY,
+    DEVELOPER_INSTRUCTIONS_KEY,
+)
+CAPABILITY_DESCRIPTOR_SCHEMA_VERSION = 1
+CODEX_PROBE_TIMEOUT_SECONDS = 5
 KEYSMITH_RUNTIME_HELPERS = None
 JOURNAL_SCHEMA_VERSION = 1
 JOURNAL_PREFIX = ".codex-keysmith-transaction-"
@@ -3761,6 +3773,11 @@ class DirectoryPlan:
     blockers: Optional[List[str]] = None
     uninstall_blockers: Optional[List[str]] = None
     warnings: Optional[List[str]] = None
+    capability: Optional["ResolvedCapability"] = None
+    install_key: Optional[str] = None
+    install_reference: Optional[str] = None
+    runtime_layer: Optional["RuntimeConfigLayer"] = None
+    discovery_layer: Optional["InstructionDiscoveryLayer"] = None
 
     def __post_init__(self) -> None:
         if self.blockers is None:
@@ -3995,6 +4012,10 @@ def inspect_directory(
     consider_legacy: bool = True,
     skip_hooks_isolation: bool = False,
     status_mode: bool = False,
+    capability: Optional["ResolvedCapability"] = None,
+    install_key: Optional[str] = None,
+    install_reference: Optional[str] = None,
+    emit_capability_blocker: bool = True,
 ) -> DirectoryPlan:
     """Build the shared read-only status/deployment plan for one directory."""
     config = _classify_node(codex_dir / "config.toml")
@@ -4013,6 +4034,34 @@ def inspect_directory(
         disabled=disabled,
         manifest=manifest,
         residue=residue,
+    )
+
+    capability_key: Optional[str] = None
+    capability_reference: Optional[str] = None
+    if capability is not None:
+        plan.capability = capability
+        if capability.usable and capability.descriptor is not None:
+            capability_key = capability.install_key
+            capability_reference = planned_install_reference(
+                codex_dir,
+                md_filename,
+                capability.descriptor,
+            )
+        elif emit_capability_blocker:
+            plan.blockers.append(capability_blocker_message(capability))
+    if install_key is not None:
+        # Manifest-driven reactivation: restore exactly what the deployment owns.
+        plan.install_key = install_key
+        plan.install_reference = install_reference
+    elif capability_key is not None:
+        plan.install_key = capability_key
+        plan.install_reference = capability_reference
+    if plan.install_key is None:
+        plan.install_key = MODEL_INSTRUCTIONS_KEY
+        plan.install_reference = f"./{md_filename}"
+    plan.discovery_layer = analyze_instruction_discovery_layer(
+        codex_dir,
+        capability,
     )
 
     if residue:
@@ -4038,17 +4087,73 @@ def inspect_directory(
                 config.path,
                 "config.toml",
             )
-            config_analysis = _analyze_toml_root(config_content)
-            plan.config_reference = config_analysis.instruction_reference
-            updated_content, changed = render_model_instructions(
+            config_analysis = _analyze_toml_root(
                 config_content,
-                md_filename,
-                analysis=config_analysis,
+                target_key=plan.install_key or MODEL_INSTRUCTIONS_KEY,
             )
+            plan.config_reference = config_analysis.instruction_reference
+            if capability is None or capability.usable:
+                updated_content, changed = render_model_instructions(
+                    config_content,
+                    md_filename,
+                    analysis=config_analysis,
+                    target_key=plan.install_key or MODEL_INSTRUCTIONS_KEY,
+                    reference=plan.install_reference,
+                )
+            else:
+                # Compatibility is fail-closed: never render an unsupported key.
+                updated_content, changed = config_content, False
             plan.config_content = config_content
             plan.updated_config_content = updated_content
             plan.config_changed = changed
             plan.config_fingerprint = config_fingerprint
+            plan.runtime_layer = analyze_runtime_config_layer(
+                codex_dir,
+                config_analysis,
+                capability,
+                md_filename,
+            )
+            if capability is not None and capability.usable:
+                for item in plan.runtime_layer.ineffective:
+                    plan.warnings.append(
+                        _localized(
+                            f"config.toml 行 {item.lineno} 的 {item.key} "
+                            "对该 Codex 版本不生效（已被废弃或属于未知键）；"
+                            "该行原样保留，未删除",
+                            f"line {item.lineno} of config.toml sets {item.key}, "
+                            "which is ineffective on this Codex version "
+                            "(deprecated or unknown); the line is preserved untouched",
+                        )
+                    )
+                if plan.runtime_layer.inline_instructions_present:
+                    plan.warnings.append(
+                        _localized(
+                            "config.toml 已设置内联 instructions：文件键 "
+                            f"{plan.install_key} 存在时优先于内联值",
+                            f"config.toml already sets inline instructions: when "
+                            f"{plan.install_key} is set the file takes precedence",
+                        )
+                    )
+                if plan.runtime_layer.developer_instructions_present:
+                    plan.warnings.append(
+                        _localized(
+                            "config.toml 的 developer_instructions 是独立 developer "
+                            "角色消息，与文件指令并存（非覆盖关系）",
+                            "config.toml developer_instructions is a separate "
+                            "developer-role message that coexists with the file "
+                            "instruction (it does not override it)",
+                        )
+                    )
+                for profile_name in plan.runtime_layer.profile_files:
+                    plan.warnings.append(
+                        _localized(
+                            f"同目录 profile 文件 {profile_name} 在 --profile 激活时"
+                            "可能遮蔽用户层配置键（仅提示，不读取该文件）",
+                            f"profile file {profile_name} in this directory may "
+                            "shadow the user-layer key when --profile is active "
+                            "(listed only; the file was not read)",
+                        )
+                    )
         except (OSError, UnicodeDecodeError, ConfigConflict) as exc:
             plan.blockers.append(f"config.toml 无法安全读取: {exc}")
 
@@ -4116,6 +4221,17 @@ def inspect_directory(
                 plan.inactive_config_blocker = prefixed
                 if prefixed not in plan.blockers:
                     plan.blockers.append(prefixed)
+            if emit_capability_blocker and capability is not None and capability.usable:
+                owned_key, _owned_reference = _manifest_config_strategy(_manifest)
+                if (
+                    owned_key in (MODEL_INSTRUCTIONS_KEY, EXPERIMENTAL_INSTRUCTIONS_KEY)
+                    and owned_key != plan.install_key
+                ):
+                    plan.blockers.append(
+                        cross_generation_manifest_blocker(
+                            owned_key, plan.install_key or MODEL_INSTRUCTIONS_KEY
+                        )
+                    )
 
     if not skip_hooks_isolation:
         for label, node in (("hooks.json", hooks), ("hooks.json.disabled", disabled)):
@@ -8737,7 +8853,10 @@ def _validate_manifest(data: Any) -> Dict[str, Any]:
         # Hand-tuned pre-0.6.0 deployments (lean5/lean7b experiments) recorded
         # an extra top-level provenance key; tolerate it when reading so those
         # deployments can be upgraded or uninstalled, but never re-emit it.
-        optional_keys={"sol_lean5_tuning"},
+        # "capability" records the versioned capability verdict at deploy time;
+        # manifests written before 0.6.x omit it and default to the modern
+        # model_instructions_file strategy when read.
+        optional_keys={"sol_lean5_tuning", "capability"},
     )
     if root["schema_version"] != MANIFEST_SCHEMA_VERSION:
         raise ValueError(f"不支持的部署清单 schema: {root['schema_version']!r}")
@@ -8768,6 +8887,12 @@ def _validate_manifest(data: Any) -> Dict[str, Any]:
         root["config"],
         {"path", "before", "after", "changed", "backup"},
         "config",
+        # "key"/"reference" record the exact config.toml strategy chosen by
+        # the versioned capability descriptor at deploy time. Manifests
+        # written before capability-aware installs omit them; such manifests
+        # always used model_instructions_file with a config-dir-relative
+        # "./<md.path>" reference, which is the default applied on read.
+        optional_keys={"key", "reference"},
     )
     if _safe_manifest_name(config["path"], "config.path", allow_none=False) != "config.toml":
         raise ValueError("config.path 必须是 config.toml")
@@ -8781,6 +8906,68 @@ def _validate_manifest(data: Any) -> Dict[str, Any]:
     _validate_backup_name(config["backup"], "config.toml", "config.backup")
     if config["changed"] != bool(config["backup"]):
         raise ValueError("config.changed 与 backup 不一致")
+    config_key = config.get("key", MODEL_INSTRUCTIONS_KEY)
+    if not isinstance(config_key, str) or config_key not in (
+        MODEL_INSTRUCTIONS_KEY,
+        EXPERIMENTAL_INSTRUCTIONS_KEY,
+    ):
+        raise ValueError("config.key 无效")
+    config_reference = config.get("reference", f'./{md["path"]}')
+    if not isinstance(config_reference, str) or not config_reference.strip():
+        raise ValueError("config.reference 无效")
+    if "\n" in config_reference or "\r" in config_reference:
+        raise ValueError("config.reference 包含非法换行")
+    if config_key == MODEL_INSTRUCTIONS_KEY and not config_reference.startswith(
+        ("./", ".\\")
+    ):
+        raise ValueError(
+            "model_instructions_file 世代的 config.reference 必须是相对 config 目录的 ./ 路径"
+        )
+    if config_key == EXPERIMENTAL_INSTRUCTIONS_KEY and not os.path.isabs(
+        config_reference
+    ):
+        raise ValueError(
+            "experimental_instructions_file 世代的 config.reference 必须是绝对路径"
+        )
+
+    capability_section = root.get("capability")
+    if capability_section is not None:
+        capability_record = _require_manifest_object(
+            capability_section,
+            {
+                "descriptor_id",
+                "codex_version",
+                "evidence_status",
+                "descriptor_schema_version",
+            },
+            "capability",
+        )
+        if (
+            capability_record["descriptor_schema_version"]
+            != CAPABILITY_DESCRIPTOR_SCHEMA_VERSION
+        ):
+            raise ValueError("capability.descriptor_schema_version 不支持")
+        if capability_record["evidence_status"] not in {"probed", "pinned"}:
+            raise ValueError("capability.evidence_status 无效")
+        descriptor = next(
+            (
+                item
+                for item in CAPABILITY_DESCRIPTORS
+                if item.descriptor_id == capability_record["descriptor_id"]
+            ),
+            None,
+        )
+        if descriptor is None:
+            raise ValueError("capability.descriptor_id 未知")
+        recorded_version = parse_pinned_codex_version(capability_record["codex_version"])
+        if not (
+            descriptor.min_inclusive
+            <= recorded_version.tuple
+            < descriptor.max_exclusive
+        ):
+            raise ValueError("capability.codex_version 与 descriptor 区间不一致")
+        if descriptor.install_key != config_key:
+            raise ValueError("capability 代际与 config.key 不一致")
 
     hooks = _require_manifest_object(
         root["hooks"],
@@ -8879,6 +9066,19 @@ def _load_manifest(path: Path) -> Tuple[Dict[str, Any], FileFingerprint]:
     except json.JSONDecodeError as exc:
         raise ValueError(f"部署清单不是有效 JSON: {path}: {exc}") from exc
     return _validate_manifest(data), fingerprint
+
+
+def _manifest_config_strategy(manifest: Dict[str, Any]) -> Tuple[str, str]:
+    """Return the (key, reference) chosen for config.toml at deploy time.
+
+    Manifests written before capability-aware installs omitted these fields;
+    they always used model_instructions_file with a config-dir-relative
+    "./<md.path>" reference, which is applied as the read-time default.
+    """
+    config = manifest["config"]
+    key = config.get("key", MODEL_INSTRUCTIONS_KEY)
+    reference = config.get("reference", f'./{manifest["md"]["path"]}')
+    return key, reference
 
 
 def detect_hooks(codex_dir: Path) -> Optional[dict]:
@@ -10045,6 +10245,8 @@ def _build_deployment_manifest(
             "after": _portable_fingerprint(config_after),
             "changed": state.config_touched,
             "backup": state.config_backup.name if state.config_backup else None,
+            "key": plan.install_key or MODEL_INSTRUCTIONS_KEY,
+            "reference": plan.install_reference or f"./{md_filename}",
         },
         "hooks": {
             "isolated": isolation is not None,
@@ -10079,6 +10281,16 @@ def _build_deployment_manifest(
             ),
         },
     }
+    capability = plan.capability
+    if capability is not None and capability.usable:
+        evidence = capability.evidence
+        if evidence.version is not None and capability.descriptor is not None:
+            manifest["capability"] = {
+                "descriptor_id": capability.descriptor.descriptor_id,
+                "codex_version": str(evidence.version),
+                "evidence_status": evidence.status,
+                "descriptor_schema_version": CAPABILITY_DESCRIPTOR_SCHEMA_VERSION,
+            }
     return _validate_manifest(manifest)
 
 
@@ -10355,11 +10567,12 @@ def _merge_uninstall_config_statement(
     current_analysis: "TomlRootAnalysis",
     original_content: str,
     original_analysis: "TomlRootAnalysis",
+    target_key: str = MODEL_INSTRUCTIONS_KEY,
 ) -> str:
     current_statement = current_analysis.instruction_statement
     if current_statement is None:
         raise ConfigConflict(
-            "当前 config.toml 缺少受管的顶层 model_instructions_file"
+            f"当前 config.toml 缺少受管的顶层 {target_key}"
         )
     original_statement = original_analysis.instruction_statement
     if original_statement is None:
@@ -10382,13 +10595,13 @@ def _merge_uninstall_config_statement(
             + current_content[current_statement.end :]
         )
 
-    merged_analysis = _analyze_toml_root(merged)
+    merged_analysis = _analyze_toml_root(merged, target_key=target_key)
     if (
         merged_analysis.instruction_reference
         != original_analysis.instruction_reference
     ):
         raise ConfigConflict(
-            "合并后的顶层 model_instructions_file 未恢复到部署前状态"
+            f"合并后的顶层 {target_key} 未恢复到部署前状态"
         )
     return merged
 
@@ -10397,8 +10610,14 @@ def _preflight_uninstall_config(
     plan: UninstallPlan,
     config: Dict[str, Any],
     md: Dict[str, Any],
+    manifest: Optional[Dict[str, Any]] = None,
 ) -> None:
     config_path = plan.codex_dir / config["path"]
+    if manifest is not None:
+        owned_key, owned_reference = _manifest_config_strategy(manifest)
+    else:
+        owned_key = config.get("key", MODEL_INSTRUCTIONS_KEY)
+        owned_reference = config.get("reference", f'./{md["path"]}')
     node = _classify_node(config_path)
     if not node.regular:
         plan.blockers.append(
@@ -10415,7 +10634,7 @@ def _preflight_uninstall_config(
             config_path,
             "config.toml",
         )
-        analysis = _analyze_toml_root(content)
+        analysis = _analyze_toml_root(content, target_key=owned_key)
     except (OSError, UnicodeDecodeError, ConfigConflict) as exc:
         plan.blockers.append(
             _localized(
@@ -10431,13 +10650,12 @@ def _preflight_uninstall_config(
         fingerprint.size == config["after"]["size"]
         and fingerprint.sha256 == config["after"]["sha256"]
     )
-    owned_reference = f'./{md["path"]}'
     if analysis.instruction_statement is None:
         plan.activation_state = "inactive"
         plan.activation_blocker = _localized(
-            "config.toml 顶层 model_instructions_file 当前缺失，"
+            f"config.toml 顶层 {owned_key} 当前缺失，"
             f"预期引用 {owned_reference}；卸载将保留当前 config.toml，不回写部署前备份",
-            "top-level config.toml model_instructions_file is missing; "
+            f"top-level config.toml {owned_key} is missing; "
             f"expected it to still reference {owned_reference}. "
             "Uninstall will leave the current config.toml unchanged "
             "and will not restore the pre-deployment backup",
@@ -10449,9 +10667,9 @@ def _preflight_uninstall_config(
     if analysis.instruction_reference != owned_reference:
         plan.activation_state = "conflict"
         plan.activation_blocker = _localized(
-            "config.toml 顶层 model_instructions_file 所有权冲突: "
+            f"config.toml 顶层 {owned_key} 所有权冲突: "
             f"当前字段指向其他路径，预期仍引用 {owned_reference}",
-            "top-level config.toml model_instructions_file ownership conflict: "
+            f"top-level config.toml {owned_key} ownership conflict: "
             "the current field is set to another path; "
             f"expected it to still reference {owned_reference}",
         )
@@ -10487,12 +10705,15 @@ def _preflight_uninstall_config(
         )
         if not _fingerprint_matches_portable(backup_fingerprint, config["before"]):
             raise ConfigConflict("config.toml 备份内容或时间戳不匹配")
-        original_analysis = _analyze_toml_root(original_content)
+        original_analysis = _analyze_toml_root(
+            original_content, target_key=owned_key
+        )
         merged = _merge_uninstall_config_statement(
             content,
             analysis,
             original_content,
             original_analysis,
+            target_key=owned_key,
         )
     except (OSError, UnicodeDecodeError, ConfigConflict) as exc:
         plan.blockers.append(
@@ -10609,7 +10830,7 @@ def inspect_uninstall_directory(
     hooks = manifest["hooks"]
     legacy = manifest["legacy"]
     previous = manifest["previous_manifest"]
-    _preflight_uninstall_config(plan, config, md)
+    _preflight_uninstall_config(plan, config, md, manifest)
     md_blocker_count = len(plan.blockers)
     _preflight_manifest_path(
         plan,
@@ -14375,6 +14596,7 @@ def uninstall(codex_dirs: List[str], yes: bool) -> None:
 class ReactivatePlan:
     codex_dir: Path
     md_filename: str = DEFAULT_MD_FILENAME
+    owned_key: Optional[str] = None
     owned_reference: Optional[str] = None
     config_content: Optional[str] = None
     updated_config_content: Optional[str] = None
@@ -14382,6 +14604,7 @@ class ReactivatePlan:
     md_fingerprint: Optional[FileFingerprint] = None
     manifest_fingerprint: Optional[FileFingerprint] = None
     skip_reason: Optional[str] = None
+    capability: Optional["ResolvedCapability"] = None
     blockers: Optional[List[str]] = None
 
     def __post_init__(self) -> None:
@@ -14417,15 +14640,61 @@ def _manifest_managed_md_filename(codex_dir: Path) -> str:
     return DEFAULT_MD_FILENAME
 
 
-def inspect_reactivate_directory(codex_dir: Path) -> ReactivatePlan:
+def _manifest_reactivate_strategy(
+    codex_dir: Path,
+    md_filename: str,
+) -> Tuple[str, str]:
+    """Read the owned (key, reference) pair from an existing manifest."""
+    manifest_node = _classify_node(codex_dir / MANIFEST_FILENAME)
+    if manifest_node.regular:
+        try:
+            manifest, _fingerprint = _load_manifest(manifest_node.path)
+        except (OSError, TypeError, UnicodeDecodeError, ValueError):
+            manifest = None
+        if manifest is not None:
+            return _manifest_config_strategy(manifest)
+    return MODEL_INSTRUCTIONS_KEY, f"./{md_filename}"
+
+
+def inspect_reactivate_directory(
+    codex_dir: Path,
+    capability: Optional["ResolvedCapability"] = None,
+) -> ReactivatePlan:
     md_filename = _manifest_managed_md_filename(codex_dir)
+    owned_key, owned_reference = _manifest_reactivate_strategy(codex_dir, md_filename)
+    result = ReactivatePlan(
+        codex_dir=codex_dir,
+        md_filename=md_filename,
+        owned_key=owned_key,
+        capability=capability,
+    )
+    if capability is not None and not capability.usable:
+        # Reactivation writes a config key; fail closed without version evidence.
+        result.blockers.append(capability_blocker_message(capability))
+        return result
+    if capability is not None and capability.install_key != owned_key:
+        result.blockers.append(
+            _localized(
+                f"部署清单记录的配置键 {owned_key} 属于另一个 Codex 代际，"
+                f"当前版本支持的键是 {capability.install_key}；"
+                "拒绝跨代际补回字段，请按当前版本重新部署（uninstall 后 deploy）。",
+                f"the manifest records config key {owned_key} from a different "
+                f"Codex generation, but this version supports "
+                f"{capability.install_key}; refusing to restore a key across "
+                "generations; redeploy for the current version "
+                "(uninstall, then deploy).",
+            )
+        )
+        return result
     plan = inspect_directory(
         codex_dir,
         md_filename=md_filename,
         skip_hooks_isolation=True,
         status_mode=True,
+        capability=capability,
+        install_key=owned_key,
+        install_reference=owned_reference,
     )
-    result = ReactivatePlan(codex_dir=codex_dir, md_filename=md_filename)
     extra_blockers = [
         blocker
         for blocker in plan.blockers
@@ -14449,7 +14718,7 @@ def inspect_reactivate_directory(codex_dir: Path) -> ReactivatePlan:
             "当前配置已是 active，无需补回字段",
             "the current config is already active; no field restoration is needed",
         )
-        result.owned_reference = f"./{md_filename}"
+        result.owned_reference = owned_reference
         return result
     if plan.activation_state != "inactive" or plan.inactive_config_blocker is None:
         if extra_blockers:
@@ -14480,13 +14749,14 @@ def inspect_reactivate_directory(codex_dir: Path) -> ReactivatePlan:
             )
         )
         return result
-    owned_reference = f"./{md_filename}"
-    restored_analysis = _analyze_toml_root(plan.updated_config_content)
+    restored_analysis = _analyze_toml_root(
+        plan.updated_config_content, target_key=owned_key
+    )
     if restored_analysis.instruction_reference != owned_reference:
         result.blockers.append(
             _localized(
-                f"恢复后的顶层 model_instructions_file 不是 {owned_reference}",
-                f"restored top-level model_instructions_file is not {owned_reference}",
+                f"恢复后的顶层 {owned_key} 不是 {owned_reference}",
+                f"restored top-level {owned_key} is not {owned_reference}",
             )
         )
         return result
@@ -14507,10 +14777,12 @@ def _verify_reactivate_result(plan: ReactivatePlan) -> None:
     )
     if content != plan.updated_config_content:
         raise ConfigConflict("重新激活后 config.toml 与预检内容不一致")
-    analysis = _analyze_toml_root(content)
+    analysis = _analyze_toml_root(
+        content, target_key=plan.owned_key or MODEL_INSTRUCTIONS_KEY
+    )
     if analysis.instruction_reference != plan.owned_reference:
         raise ConfigConflict(
-            "重新激活后顶层 model_instructions_file 未指向受管提示词"
+            f"重新激活后顶层 {plan.owned_key} 未指向受管提示词"
         )
     md_path = plan.codex_dir / plan.md_filename
     if plan.md_fingerprint is None or not _path_has_fingerprint(
@@ -14524,10 +14796,13 @@ def _verify_reactivate_result(plan: ReactivatePlan) -> None:
         plan.manifest_fingerprint,
     ):
         raise HooksConflict("重新激活后部署清单发生变化")
-    verify_plan = inspect_reactivate_directory(plan.codex_dir)
+    verify_plan = inspect_reactivate_directory(plan.codex_dir, plan.capability)
     if verify_plan.blockers or verify_plan.skip_reason is None:
         raise HooksConflict("重新激活后状态不是 active")
-    if verify_plan.owned_reference != plan.owned_reference:
+    if (
+        verify_plan.owned_reference != plan.owned_reference
+        or verify_plan.owned_key != plan.owned_key
+    ):
         raise HooksConflict("重新激活后受管引用发生变化")
 
 
@@ -14576,11 +14851,18 @@ def _rollback_reactivate_state(state: ReactivateState) -> None:
     )
 
 
-def _reactivate_locked(codex_dirs: List[str], yes: bool) -> None:
+def _reactivate_locked(
+    codex_dirs: List[str],
+    yes: bool,
+    capability: Optional["ResolvedCapability"] = None,
+) -> None:
     if not codex_dirs:
         _print("[完成] 未找到 codex-keysmith 部署清单；无需重新激活。")
         return
-    plans = [inspect_reactivate_directory(Path(directory)) for directory in codex_dirs]
+    plans = [
+        inspect_reactivate_directory(Path(directory), capability)
+        for directory in codex_dirs
+    ]
     blockers = [
         f"{plan.codex_dir}: {blocker}"
         for plan in plans
@@ -14599,9 +14881,9 @@ def _reactivate_locked(codex_dirs: List[str], yes: bool) -> None:
         _print(
             _localized(
                 f"  [计划] {plan.codex_dir}: 恢复顶层 "
-                f'model_instructions_file = "{plan.owned_reference}"',
+                f'{plan.owned_key} = "{plan.owned_reference}"',
                 f"  [Plan] {plan.codex_dir}: restore top-level "
-                f'model_instructions_file = "{plan.owned_reference}"',
+                f'{plan.owned_key} = "{plan.owned_reference}"',
             )
         )
         _print(
@@ -14636,7 +14918,8 @@ def _reactivate_locked(codex_dirs: List[str], yes: bool) -> None:
         return
 
     refreshed = [
-        inspect_reactivate_directory(plan.codex_dir) for plan in actionable
+        inspect_reactivate_directory(plan.codex_dir, capability)
+        for plan in actionable
     ]
     refresh_blockers = [
         f"{plan.codex_dir}: {blocker}"
@@ -14658,7 +14941,8 @@ def _reactivate_locked(codex_dirs: List[str], yes: bool) -> None:
         sys.exit(1)
     for original, current in zip(actionable, refreshed):
         if (
-            original.owned_reference != current.owned_reference
+            original.owned_key != current.owned_key
+            or original.owned_reference != current.owned_reference
             or original.updated_config_content != current.updated_config_content
             or original.config_fingerprint != current.config_fingerprint
             or original.md_fingerprint != current.md_fingerprint
@@ -14764,18 +15048,24 @@ def _reactivate_locked(codex_dirs: List[str], yes: bool) -> None:
             raise HooksConflict(f"重新激活成功但缺少 config.toml 备份: {plan.codex_dir}")
         _print(f"  [备份] config.toml → {state.backup.name}")
         _print(
-            "  [配置] 已设置 model_instructions_file = "
+            f"  [配置] 已设置 {plan.owned_key or MODEL_INSTRUCTIONS_KEY} = "
             f'"{plan.owned_reference}"'
         )
     _print(f"[完成] 已重新激活 {len(states)} 个配置引用。")
 
 
-def reactivate(codex_dirs: List[str], yes: bool) -> None:
+def reactivate(
+    codex_dirs: List[str],
+    yes: bool,
+    capability: Optional["ResolvedCapability"] = None,
+) -> None:
     if not yes or not codex_dirs:
-        _reactivate_locked(codex_dirs, yes)
+        _reactivate_locked(codex_dirs, yes, capability)
         return
     with _DirectoryLockSet(codex_dirs) as locks:
-        _reactivate_locked([str(item.path) for item in locks.directories], yes)
+        _reactivate_locked(
+            [str(item.path) for item in locks.directories], yes, capability
+        )
 
 
 @dataclass(frozen=True)
@@ -14784,6 +15074,15 @@ class TomlRootStatement:
     end: int
     key: Optional[str]
     raw_value: str
+    lineno: int = 0
+    raw_key: str = ""
+
+
+@dataclass(frozen=True)
+class TomlTableHeader:
+    name: str
+    start: int
+    lineno: int
 
 
 @dataclass(frozen=True)
@@ -14793,6 +15092,9 @@ class TomlRootAnalysis:
     instruction_reference: Optional[str]
     first_table_start: Optional[int]
     newline: str
+    target_key: str = MODEL_INSTRUCTIONS_KEY
+    root_statements: Tuple[TomlRootStatement, ...] = ()
+    table_headers: Tuple[TomlTableHeader, ...] = ()
 
 
 def _line_bounds(content: str, start: int) -> Tuple[int, int]:
@@ -14925,12 +15227,15 @@ def _first_dotted_toml_key(raw_key: str) -> Tuple[str, bool]:
     return parts[0], len(parts) > 1
 
 
-def _parse_simple_toml_key(raw_key: str) -> Optional[str]:
+def _parse_simple_toml_key(
+    raw_key: str,
+    target_key: str = MODEL_INSTRUCTIONS_KEY,
+) -> Optional[str]:
     first_key, dotted = _first_dotted_toml_key(raw_key)
     if dotted:
-        if first_key == "model_instructions_file":
+        if first_key == target_key:
             raise ConfigConflict(
-                "model_instructions_file 已作为 dotted key 命名空间使用，拒绝写入标量"
+                f"{target_key} 已作为 dotted key 命名空间使用，拒绝写入标量"
             )
         return None
     return first_key
@@ -15111,7 +15416,7 @@ def _strip_table_comment(header: str) -> str:
     return header
 
 
-def _validate_table_header(header: str) -> None:
+def _validate_table_header(header: str, target_key: str = MODEL_INSTRUCTIONS_KEY) -> None:
     normalized = _strip_table_comment(header).strip()
     if normalized.startswith("[["):
         if not normalized.endswith("]]") or not normalized[2:-2].strip():
@@ -15124,10 +15429,11 @@ def _validate_table_header(header: str) -> None:
     else:
         raise ConfigConflict("无法安全识别 TOML 表头")
     key_path = _parse_dotted_toml_key(raw_key)
-    if key_path[0] == "model_instructions_file":
+    if key_path[0] == target_key:
         raise ConfigConflict(
-            "model_instructions_file 已作为 TOML 表命名空间使用，拒绝写入标量"
+            f"{target_key} 已作为 TOML 表命名空间使用，拒绝写入标量"
         )
+    return normalized
 
 
 def _parse_inline_multiline_string(value: str) -> Optional[str]:
@@ -15261,7 +15567,10 @@ def _detect_newline(content: str) -> str:
     return "\n"
 
 
-def _analyze_toml_root(content: str) -> TomlRootAnalysis:
+def _analyze_toml_root(
+    content: str,
+    target_key: str = MODEL_INSTRUCTIONS_KEY,
+) -> TomlRootAnalysis:
     """Conservatively locate top-level TOML keys without parsing nested tables."""
     # This zero-dependency scanner protects the target field and rejects
     # unsupported/ambiguous statement boundaries.  It is deliberately not a
@@ -15269,6 +15578,7 @@ def _analyze_toml_root(content: str) -> TomlRootAnalysis:
     # redefinition can remain outside what it proves.
     index = 1 if content.startswith("\ufeff") else 0
     statements = []
+    table_headers = []
     first_table_start = None
     in_root = True
     while index < len(content):
@@ -15281,7 +15591,18 @@ def _analyze_toml_root(content: str) -> TomlRootAnalysis:
             index = line_end
             continue
         if content[significant] == "[":
-            _validate_table_header(content[significant:line_content_end])
+            normalized_header = _validate_table_header(
+                content[significant:line_content_end],
+                target_key,
+            )
+            lineno = content.count("\n", 0, line_start) + 1
+            table_headers.append(
+                TomlTableHeader(
+                    name=normalized_header,
+                    start=line_start,
+                    lineno=lineno,
+                )
+            )
             if first_table_start is None:
                 first_table_start = line_start
             in_root = False
@@ -15291,7 +15612,7 @@ def _analyze_toml_root(content: str) -> TomlRootAnalysis:
         equals_at = _find_key_equals(content, significant, line_content_end)
         raw_key = content[significant:equals_at]
         if in_root:
-            key = _parse_simple_toml_key(raw_key)
+            key = _parse_simple_toml_key(raw_key, target_key)
         else:
             _parse_dotted_toml_key(raw_key)
             key = None
@@ -15303,6 +15624,8 @@ def _analyze_toml_root(content: str) -> TomlRootAnalysis:
                     end=statement_end,
                     key=key,
                     raw_value=content[equals_at + 1 : statement_end],
+                    lineno=content.count("\n", 0, line_start) + 1,
+                    raw_key=raw_key.strip(),
                 )
             )
         index = statement_end
@@ -15310,10 +15633,10 @@ def _analyze_toml_root(content: str) -> TomlRootAnalysis:
     instruction_statements = [
         statement
         for statement in statements
-        if statement.key == "model_instructions_file"
+        if statement.key == target_key
     ]
     if len(instruction_statements) > 1:
-        raise ConfigConflict("发现重复的顶层 model_instructions_file，拒绝猜测修改")
+        raise ConfigConflict(f"发现重复的顶层 {target_key}，拒绝猜测修改")
     model_statement = next(
         (statement for statement in statements if statement.key == "model"),
         None,
@@ -15328,7 +15651,7 @@ def _analyze_toml_root(content: str) -> TomlRootAnalysis:
     )
     if instruction_statement and instruction_reference is None:
         raise ConfigConflict(
-            "顶层 model_instructions_file 不是可安全识别的 TOML 字符串"
+            f"顶层 {target_key} 不是可安全识别的 TOML 字符串"
         )
     return TomlRootAnalysis(
         instruction_statement=instruction_statement,
@@ -15336,6 +15659,9 @@ def _analyze_toml_root(content: str) -> TomlRootAnalysis:
         instruction_reference=instruction_reference,
         first_table_start=first_table_start,
         newline=_detect_newline(content),
+        target_key=target_key,
+        root_statements=tuple(statements),
+        table_headers=tuple(table_headers),
     )
 
 
@@ -15365,14 +15691,17 @@ def render_model_instructions(
     content: str,
     md_filename: str,
     analysis: Optional[TomlRootAnalysis] = None,
+    target_key: str = MODEL_INSTRUCTIONS_KEY,
+    reference: Optional[str] = None,
 ) -> Tuple[str, bool]:
     """Return a conservative, formatting-preserving top-level TOML update."""
-    root = analysis or _analyze_toml_root(content)
-    target_reference = f"./{md_filename}"
-    target_line = f'model_instructions_file = "{target_reference}"'
+    root = analysis or _analyze_toml_root(content, target_key)
+    if reference is None:
+        reference = f"./{md_filename}"
+    target_line = f'{target_key} = "{reference}"'
     statement = root.instruction_statement
     if statement:
-        if root.instruction_reference == target_reference:
+        if root.instruction_reference == reference:
             return content, False
         ending = _statement_newline(content, statement)
         return (
@@ -15387,18 +15716,30 @@ def render_model_instructions(
         insert_at = root.model_statement.end
     elif root.first_table_start is not None:
         insert_at = root.first_table_start
+    elif root.root_statements:
+        insert_at = root.root_statements[-1].end
     else:
         insert_at = len(content)
     return _insert_toml_line(content, insert_at, target_line, root.newline), True
 
 
-def ensure_model_instructions(config_path: Path, md_filename: str) -> bool:
+def ensure_model_instructions(
+    config_path: Path,
+    md_filename: str,
+    target_key: str = MODEL_INSTRUCTIONS_KEY,
+    reference: Optional[str] = None,
+) -> bool:
     """Ensure config.toml has the requested top-level instruction file."""
     content, expected_fingerprint = _read_regular_text_with_fingerprint(
         config_path,
         "config.toml",
     )
-    updated_content, changed = render_model_instructions(content, md_filename)
+    updated_content, changed = render_model_instructions(
+        content,
+        md_filename,
+        target_key=target_key,
+        reference=reference,
+    )
     if not changed:
         return False
     atomic_write_text(
@@ -15487,6 +15828,747 @@ def instruction_mode_report(codex_dir: Path, config_text: str, preset: str) -> D
     }
 
 
+# ─── Codex 版本能力描述符与分层配置模型 ─────────────────────────────────────
+# 上游 Codex CLI 的配置面快速演化。所有区间均为 2026-10 对 openai/codex
+# 已发布 tag（rust-v*）源码逐一核实的结果；区间外版本一律按未知处理并阻断，
+# 绝不静默写入未被该版本支持的配置键。
+
+CODEX_VERSION_CORE_RE = re.compile(
+    r"(?<![0-9.])(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?"
+    r"(?:\+[0-9A-Za-z.-]+)?(?![0-9.])"
+)
+PINNED_CODEX_VERSION_RE = re.compile(
+    r"^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$"
+)
+
+
+@dataclass(frozen=True)
+class CodexVersion:
+    major: int
+    minor: int
+    patch: int
+    raw: str = ""
+    prerelease: Optional[str] = None
+
+    @property
+    def tuple(self) -> Tuple[int, int, int]:
+        return (self.major, self.minor, self.patch)
+
+    def __str__(self) -> str:
+        if self.prerelease is not None:
+            return f"{self.major}.{self.minor}.{self.patch}-{self.prerelease}"
+        return f"{self.major}.{self.minor}.{self.patch}"
+
+
+@dataclass(frozen=True)
+class CapabilityDescriptor:
+    descriptor_id: str
+    min_inclusive: Tuple[int, int, int]
+    max_exclusive: Tuple[int, int, int]
+    install_key: Optional[str]
+    reference_style: Optional[str]
+    deprecated_keys: Tuple[str, ...]
+    agents_md_global: bool
+    evidence: str
+
+
+CAPABILITY_DESCRIPTORS: Tuple[CapabilityDescriptor, ...] = (
+    CapabilityDescriptor(
+        descriptor_id="legacy-inline-only",
+        min_inclusive=(0, 2, 0),
+        max_exclusive=(0, 10, 0),
+        install_key=None,
+        reference_style=None,
+        deprecated_keys=(),
+        agents_md_global=True,
+        evidence=(
+            "upstream tags rust-v0.2.0..rust-v0.9.0 codex-rs/config/mod.rs: "
+            "only the inline `instructions` key exists; no instruction-file "
+            "key; global AGENTS.md discovery present"
+        ),
+    ),
+    CapabilityDescriptor(
+        descriptor_id="experimental-instructions-file",
+        min_inclusive=(0, 10, 0),
+        max_exclusive=(0, 90, 0),
+        install_key=EXPERIMENTAL_INSTRUCTIONS_KEY,
+        reference_style="absolute",
+        deprecated_keys=(),
+        agents_md_global=True,
+        evidence=(
+            "upstream tags rust-v0.10.0..rust-v0.80.x codex-rs/config/mod.rs: "
+            "experimental_instructions_file: Option<PathBuf>; relative paths "
+            "resolve against the process working directory; "
+            "model_instructions_file is an unknown (ignored) key"
+        ),
+    ),
+    CapabilityDescriptor(
+        descriptor_id="model-instructions-file",
+        min_inclusive=(0, 90, 0),
+        max_exclusive=(0, 161, 0),
+        install_key=MODEL_INSTRUCTIONS_KEY,
+        reference_style="config-relative",
+        deprecated_keys=(EXPERIMENTAL_INSTRUCTIONS_KEY,),
+        agents_md_global=True,
+        evidence=(
+            "upstream tags rust-v0.90.0..rust-v0.160.1 codex-rs/config/mod.rs "
+            "and core/config.schema.json: model_instructions_file: "
+            "AbsolutePathBuf (relative paths resolve against the config file "
+            "directory); experimental_instructions_file is parsed but "
+            "deprecated/ignored, and removed from the schema at 0.140"
+        ),
+    ),
+)
+
+
+def descriptor_for_version(
+    version: Tuple[int, int, int],
+) -> Optional[CapabilityDescriptor]:
+    for descriptor in CAPABILITY_DESCRIPTORS:
+        if descriptor.min_inclusive <= version < descriptor.max_exclusive:
+            return descriptor
+    return None
+
+
+def parse_codex_version(text: str) -> Optional[CodexVersion]:
+    """Extract the first strict X.Y.Z version token from `codex --version`."""
+    match = CODEX_VERSION_CORE_RE.search(text or "")
+    if not match:
+        return None
+    return CodexVersion(
+        major=int(match.group(1)),
+        minor=int(match.group(2)),
+        patch=int(match.group(3)),
+        raw=match.group(0),
+        prerelease=match.group(4),
+    )
+
+
+def parse_pinned_codex_version(text: str) -> CodexVersion:
+    match = PINNED_CODEX_VERSION_RE.fullmatch((text or "").strip())
+    if not match:
+        raise ValueError(
+            _localized(
+                f"无法把 {text!r} 解析为 Codex 语义化版本（应为 X.Y.Z，可带 - 后缀）",
+                f"could not parse {text!r} as a Codex semantic version "
+                "(expected X.Y.Z, with an optional -suffix)",
+            )
+        )
+    return CodexVersion(
+        major=int(match.group(1)),
+        minor=int(match.group(2)),
+        patch=int(match.group(3)),
+        raw=match.group(0),
+        prerelease=match.group(4),
+    )
+
+
+@dataclass(frozen=True)
+class VersionEvidence:
+    status: str  # probed | pinned | unavailable | unparseable
+    version: Optional[CodexVersion]
+    source: str
+    executable: Optional[str]
+    raw_output: str
+
+
+@dataclass(frozen=True)
+class ResolvedCapability:
+    evidence: VersionEvidence
+    descriptor: Optional[CapabilityDescriptor]
+    reason: Optional[str] = None
+
+    @property
+    def usable(self) -> bool:
+        return self.reason is None and self.descriptor is not None and bool(
+            self.descriptor.install_key
+        )
+
+    @property
+    def install_key(self) -> Optional[str]:
+        return self.descriptor.install_key if self.usable else None
+
+    @property
+    def reference_style(self) -> Optional[str]:
+        return self.descriptor.reference_style if self.usable else None
+
+
+def probe_codex_version(codex_bin: Optional[str] = None) -> VersionEvidence:
+    """Probe a local Codex CLI via `<codex> --version`; never raises."""
+    candidate = codex_bin or shutil.which("codex")
+    if not candidate:
+        return VersionEvidence(
+            status="unavailable",
+            version=None,
+            source="PATH",
+            executable=None,
+            raw_output="",
+        )
+    try:
+        completed = subprocess.run(
+            [candidate, "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=CODEX_PROBE_TIMEOUT_SECONDS,
+            shell=False,
+        )
+    except (FileNotFoundError, PermissionError, OSError, subprocess.TimeoutExpired):
+        return VersionEvidence(
+            status="unavailable",
+            version=None,
+            source=candidate,
+            executable=candidate,
+            raw_output="",
+        )
+    raw = "\n".join(
+        part.strip() for part in (completed.stdout, completed.stderr) if part
+    ).strip()
+    version = parse_codex_version(raw)
+    if completed.returncode != 0 or version is None:
+        return VersionEvidence(
+            status="unparseable",
+            version=None,
+            source=candidate,
+            executable=candidate,
+            raw_output=raw,
+        )
+    return VersionEvidence(
+        status="probed",
+        version=version,
+        source=candidate,
+        executable=candidate,
+        raw_output=raw,
+    )
+
+
+def resolve_capability(
+    explicit_version: Optional[str] = None,
+    codex_bin: Optional[str] = None,
+) -> ResolvedCapability:
+    """Resolve evidence -> descriptor -> install strategy (fail-closed)."""
+    if explicit_version:
+        version = parse_pinned_codex_version(explicit_version)
+        evidence = VersionEvidence(
+            status="pinned",
+            version=version,
+            source="--codex-version",
+            executable=None,
+            raw_output=str(version),
+        )
+    else:
+        evidence = probe_codex_version(codex_bin)
+
+    if evidence.status == "unavailable":
+        return ResolvedCapability(evidence, None, "unavailable")
+    if evidence.status == "unparseable" or evidence.version is None:
+        return ResolvedCapability(evidence, None, "unparseable")
+
+    descriptor = descriptor_for_version(evidence.version.tuple)
+    if descriptor is None:
+        highest = CAPABILITY_DESCRIPTORS[-1].max_exclusive
+        reason = (
+            "unknown-older"
+            if evidence.version.tuple < CAPABILITY_DESCRIPTORS[0].min_inclusive
+            else "unknown-newer"
+        )
+        if evidence.version.tuple >= highest or reason == "unknown-older":
+            return ResolvedCapability(evidence, None, reason)
+        return ResolvedCapability(evidence, None, "unknown-newer")
+    if not descriptor.install_key:
+        return ResolvedCapability(evidence, descriptor, "file-install-unsupported")
+    return ResolvedCapability(evidence, descriptor, None)
+
+
+def planned_install_reference(
+    codex_dir: Path,
+    md_filename: str,
+    descriptor: CapabilityDescriptor,
+) -> str:
+    if descriptor.reference_style == "absolute":
+        # Experimental-era builds resolve relative paths against process cwd;
+        # pin an absolute reference so the link works from any launch cwd.
+        return str((Path(codex_dir) / md_filename).resolve())
+    return f"./{md_filename}"
+
+
+def capability_evidence_text(capability: ResolvedCapability) -> str:
+    evidence = capability.evidence
+    if evidence.status == "probed" and evidence.version is not None:
+        return _localized(
+            f"codex {evidence.version}（探测自 {evidence.executable} --version）",
+            f"codex {evidence.version} (probed via {evidence.executable} --version)",
+        )
+    if evidence.status == "pinned" and evidence.version is not None:
+        return _localized(
+            f"codex {evidence.version}（--codex-version 显式指定）",
+            f"codex {evidence.version} (pinned via --codex-version)",
+        )
+    if evidence.status == "unparseable":
+        return _localized(
+            f"无法解析 codex 版本（来源: {evidence.source}；原始输出: "
+            f"{evidence.raw_output or '<empty>'}）",
+            f"could not parse the codex version (source: {evidence.source}; "
+            f"raw output: {evidence.raw_output or '<empty>'})",
+        )
+    return _localized(
+        "未取得版本证据（PATH 上未找到 codex，且未提供 --codex-version/--codex-bin）",
+        "no version evidence (codex was not found on PATH and neither "
+        "--codex-version nor --codex-bin was provided)",
+    )
+
+
+def capability_blocker_message(capability: ResolvedCapability) -> str:
+    """The fail-closed verdict appended to deployment/reactivation blockers."""
+    evidence = capability.evidence
+    version_text = str(evidence.version) if evidence.version is not None else "<unknown>"
+    reason = capability.reason
+    if reason == "unavailable":
+        detail = _localized(
+            "无法在 PATH 上探测到 codex，也没有显式版本证据。",
+            "codex could not be probed on PATH and no explicit version evidence was given.",
+        )
+    elif reason == "unparseable":
+        detail = _localized(
+            f"`{evidence.source} --version` 的输出无法解析为 X.Y.Z 版本。",
+            f"the output of `{evidence.source} --version` could not be parsed as X.Y.Z.",
+        )
+    elif reason == "file-install-unsupported":
+        descriptor = capability.descriptor
+        detail = _localized(
+            f"版本 {version_text} 属于 {descriptor.descriptor_id if descriptor else '?'} "
+            "代际：该版本没有文件型指令配置键（仅支持内联 instructions），"
+            "无法以写 config.toml 键的方式安装指令文件。",
+            f"version {version_text} matches generation "
+            f"{descriptor.descriptor_id if descriptor else '?'}: it has no "
+            "file-based instruction config key (inline `instructions` only), "
+            "so an instruction file cannot be installed through config.toml.",
+        )
+    elif reason == "unknown-older":
+        detail = _localized(
+            f"版本 {version_text} 早于已核实的最旧代际 "
+            f"{'.'.join(map(str, CAPABILITY_DESCRIPTORS[0].min_inclusive))}，"
+            "其配置面未被核实。",
+            f"version {version_text} is older than the oldest verified generation "
+            f"{'.'.join(map(str, CAPABILITY_DESCRIPTORS[0].min_inclusive))}; "
+            "its configuration surface is unverified.",
+        )
+    else:
+        highest = ".".join(map(str, CAPABILITY_DESCRIPTORS[-1].max_exclusive))
+        detail = _localized(
+            f"版本 {version_text} 新于 keysmith 已核实的最高稳定代际（< {highest}）；"
+            "配置键可能已经变化，按未知版本处理。",
+            f"version {version_text} is newer than the highest verified stable "
+            f"generation (< {highest}); config keys may have changed and the "
+            "version is treated as unknown.",
+        )
+    return _localized(
+        "兼容性阻断：无法确认该 Codex 版本支持的配置键，已拒绝写入任何 "
+        f"config.toml 指令键。{detail} 请使用 --codex-version X.Y.Z 或 "
+        "--codex-bin /path/to/codex 提供可验证的版本证据；若该版本较新，"
+        "请先升级 codex-keysmith 后再部署。",
+        "Compatibility blocked: no verified config-key capability for this Codex "
+        f"version; no config.toml instruction key was written. {detail} "
+        "Provide verifiable evidence with --codex-version X.Y.Z or "
+        "--codex-bin /path/to/codex; if this Codex is newer, upgrade "
+        "codex-keysmith before deploying.",
+    )
+
+
+def cross_generation_manifest_blocker(owned_key: str, supported_key: str) -> str:
+    """Fail-closed verdict when redeploying across instruction-key generations."""
+    return _localized(
+        f"现有部署清单记录的配置键 {owned_key} 属于另一个 Codex 代际，"
+        f"当前版本支持的键是 {supported_key}；拒绝跨代际并存写入"
+        "（否则旧键会残留且无法随卸载清理）。"
+        "请先卸载现有部署（uninstall），再按当前版本重新部署（deploy）。",
+        f"the existing deployment manifest records config key {owned_key} from a "
+        f"different Codex generation, but this version supports {supported_key}; "
+        "refusing to deploy across generations (otherwise the stale key would "
+        "remain behind and could not be cleaned up on uninstall). Uninstall the "
+        "existing deployment first, then deploy again for this version.",
+    )
+
+
+# ── 分层配置模型：config.toml 运行配置层 vs AGENTS.md 指令发现层 ────────────
+
+
+@dataclass(frozen=True)
+class ConfigKeyOccurrence:
+    key: str
+    lineno: int
+    value: Optional[str]
+
+
+@dataclass(frozen=True)
+class PreservedRootKey:
+    name: str
+    lineno: int
+
+
+@dataclass(frozen=True)
+class RuntimeConfigLayer:
+    path: Path
+    managed_key: Optional[str]
+    managed_value: Optional[str]
+    managed_present: bool
+    planned_reference: Optional[str]
+    reference_base: Optional[str]  # "config-dir" | "cwd" | None
+    occurrences: Tuple[ConfigKeyOccurrence, ...]
+    ineffective: Tuple[ConfigKeyOccurrence, ...]
+    inline_instructions_present: bool
+    developer_instructions_present: bool
+    preserved_keys: Tuple[PreservedRootKey, ...]
+    preserved_tables: Tuple[TomlTableHeader, ...]
+    profile_files: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class InstructionDiscoveryLayer:
+    global_agents: Path
+    state: str  # present-nonempty | present-empty | missing | unreadable
+    supported: Optional[bool]
+
+
+def _statement_display_name(statement: TomlRootStatement) -> str:
+    if statement.key is not None:
+        return statement.key
+    return statement.raw_key or "<dotted-key>"
+
+
+def analyze_runtime_config_layer(
+    codex_dir: Path,
+    analysis: TomlRootAnalysis,
+    capability: Optional[ResolvedCapability],
+    md_filename: str,
+) -> RuntimeConfigLayer:
+    descriptor = capability.descriptor if capability is not None else None
+    usable = bool(capability and capability.usable)
+    managed_key = capability.install_key if usable else None
+    planned = (
+        planned_install_reference(codex_dir, md_filename, descriptor)
+        if usable and descriptor is not None
+        else None
+    )
+    reference_base = (
+        "config-dir" if descriptor and descriptor.reference_style == "config-relative"
+        else ("cwd" if descriptor and descriptor.reference_style == "absolute" else None)
+    )
+
+    occurrences: List[ConfigKeyOccurrence] = []
+    for statement in analysis.root_statements:
+        name = _statement_display_name(statement)
+        if name not in KNOWN_INSTRUCTION_CONFIG_KEYS:
+            continue
+        value = (
+            _parse_string_value(statement.raw_value)
+            if statement.key is not None
+            else None
+        )
+        occurrences.append(
+            ConfigKeyOccurrence(
+                key=name,
+                lineno=statement.lineno,
+                value=value,
+            )
+        )
+
+    managed_value = None
+    managed_present = False
+    ineffective: List[ConfigKeyOccurrence] = []
+    for item in occurrences:
+        if managed_key is not None and item.key == managed_key:
+            managed_present = True
+            managed_value = item.value
+        elif not usable:
+            continue
+        elif descriptor and item.key in descriptor.deprecated_keys:
+            ineffective.append(item)
+        elif (
+            descriptor
+            and descriptor.install_key == EXPERIMENTAL_INSTRUCTIONS_KEY
+            and item.key == MODEL_INSTRUCTIONS_KEY
+        ):
+            # model_instructions_file did not exist yet; an unknown TOML key is
+            # silently ignored by this Codex generation.
+            ineffective.append(item)
+        elif (
+            descriptor
+            and descriptor.install_key is None
+            and item.key
+            in (MODEL_INSTRUCTIONS_KEY, EXPERIMENTAL_INSTRUCTIONS_KEY)
+        ):
+            ineffective.append(item)
+
+    preserved = [
+        PreservedRootKey(
+            name=_statement_display_name(statement),
+            lineno=statement.lineno,
+        )
+        for statement in analysis.root_statements
+        if _statement_display_name(statement) not in KNOWN_INSTRUCTION_CONFIG_KEYS
+    ]
+
+    profile_files: List[str] = []
+    try:
+        for entry in sorted(os.scandir(str(codex_dir)), key=lambda item: item.name):
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            name = entry.name
+            if name.endswith(".config.toml") and name != "config.toml":
+                profile_files.append(name)
+    except (FileNotFoundError, NotADirectoryError, PermissionError, OSError):
+        profile_files = []
+
+    return RuntimeConfigLayer(
+        path=codex_dir / "config.toml",
+        managed_key=managed_key,
+        managed_value=managed_value,
+        managed_present=managed_present,
+        planned_reference=planned,
+        reference_base=reference_base,
+        occurrences=tuple(occurrences),
+        ineffective=tuple(ineffective),
+        inline_instructions_present=any(
+            item.key == INLINE_INSTRUCTIONS_KEY for item in occurrences
+        ),
+        developer_instructions_present=any(
+            item.key == DEVELOPER_INSTRUCTIONS_KEY for item in occurrences
+        ),
+        preserved_keys=tuple(preserved),
+        preserved_tables=analysis.table_headers,
+        profile_files=tuple(profile_files),
+    )
+
+
+def analyze_instruction_discovery_layer(
+    codex_dir: Path,
+    capability: Optional[ResolvedCapability],
+) -> InstructionDiscoveryLayer:
+    supported = (
+        capability.descriptor.agents_md_global
+        if capability is not None and capability.descriptor is not None
+        else None
+    )
+    agents = Path(codex_dir) / "AGENTS.md"
+    node = _classify_node(agents)
+    if not node.exists:
+        state = "missing"
+    elif not node.regular:
+        state = "unreadable"
+    else:
+        try:
+            text = agents.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            state = "unreadable"
+        else:
+            state = "present-nonempty" if text.strip() else "present-empty"
+    return InstructionDiscoveryLayer(
+        global_agents=agents,
+        state=state,
+        supported=supported,
+    )
+
+
+def print_capability_report(capability: ResolvedCapability, indent: str = "    ") -> None:
+    descriptor = capability.descriptor
+    if capability.usable and descriptor is not None:
+        base = (
+            _localized(
+                "相对路径相对 config.toml 所在目录解析",
+                "relative paths resolve against the config.toml directory",
+            )
+            if descriptor.reference_style == "config-relative"
+            else _localized(
+                "相对路径相对启动时工作目录解析（因此将写入绝对路径）",
+                "relative paths resolve against the launch working directory "
+                "(an absolute reference is therefore written)",
+            )
+        )
+        _print(
+            _localized(
+                f"{indent}兼容性: {capability_evidence_text(capability)}；"
+                f"能力代际 {descriptor.descriptor_id}；配置键 "
+                f"{descriptor.install_key} 受该版本支持（{base}）。",
+                f"{indent}Compatibility: {capability_evidence_text(capability)}; "
+                f"descriptor {descriptor.descriptor_id}; config key "
+                f"{descriptor.install_key} is recognized by this Codex ({base}).",
+            )
+        )
+        return
+    if reason := capability.reason:
+        label = {
+            "unavailable": _localized("版本证据不可用", "version evidence unavailable"),
+            "unparseable": _localized("版本输出不可解析", "version output unparseable"),
+            "file-install-unsupported": _localized(
+                "该代际不支持文件型指令键",
+                "this generation has no file-based instruction key",
+            ),
+            "unknown-older": _localized("版本早于已核实范围", "version older than the verified range"),
+            "unknown-newer": _localized("版本新于已核实范围", "version newer than the verified range"),
+        }.get(reason, reason)
+        descriptor_id = descriptor.descriptor_id if descriptor else "none"
+        _print(
+            _localized(
+                f"{indent}兼容性: {capability_evidence_text(capability)}；"
+                f"能力代际 {descriptor_id}；结论: {label}（fail-closed，见阻塞项）。",
+                f"{indent}Compatibility: {capability_evidence_text(capability)}; "
+                f"descriptor {descriptor_id}; verdict: {label} "
+                "(fail-closed; see blocker).",
+            )
+        )
+
+
+def print_runtime_config_layer(
+    layer: Optional[RuntimeConfigLayer],
+    capability: ResolvedCapability,
+    indent: str = "    ",
+) -> None:
+    if layer is None:
+        return
+    sub = indent + "  "
+    _print(
+        _localized(
+            f"{indent}运行配置层: {layer.path}（用户层；运行时优先级低于 "
+            "CLI 参数/--config、受信项目 .codex/config.toml 与 --profile 文件）",
+            f"{indent}Runtime config layer: {layer.path} (user layer; lower "
+            "precedence than CLI flags/--config, trusted project "
+            ".codex/config.toml, and the active --profile file)",
+        )
+    )
+    if layer.managed_key is not None:
+        current = layer.managed_value if layer.managed_present else _localized(
+            "<未设置>", "<unset>"
+        )
+        _print(
+            _localized(
+                f"{sub}受管键: {layer.managed_key}（当前值: {current}；"
+                f"将写入: \"{layer.planned_reference}\"）",
+                f"{sub}managed key: {layer.managed_key} (current: {current}; "
+                f'planned: "{layer.planned_reference}")',
+            )
+        )
+    else:
+        _print(
+            _localized(
+                f"{sub}受管键: 无（兼容性未确认，不写入任何指令配置键）",
+                f"{sub}managed key: none (compatibility unconfirmed; no "
+                "instruction config key will be written)",
+            )
+        )
+    for item in layer.ineffective:
+        _print(
+            _localized(
+                f"{sub}失效键（该版本忽略，行 {item.lineno}，原样保留不删除）: {item.key}",
+                f"{sub}ineffective key (ignored by this Codex, line {item.lineno}, "
+                f"preserved untouched): {item.key}",
+            )
+        )
+    if layer.inline_instructions_present:
+        _print(
+            _localized(
+                f"{sub}内联 instructions 已存在: 文件键存在时优先于内联值（拼接链不受影响）",
+                f"{sub}inline instructions present: when the file key is set it "
+                "takes precedence over the inline value",
+            )
+        )
+    if layer.developer_instructions_present:
+        _print(
+            _localized(
+                f"{sub}developer_instructions 已存在: 独立 developer 角色消息，"
+                "与文件指令并存而非覆盖关系",
+                f"{sub}developer_instructions present: a separate developer-role "
+                "message; it coexists with the file instruction and does not override it",
+            )
+        )
+    preserved = ", ".join(
+        _localized(
+            f"{item.name}（行 {item.lineno}）",
+            f"{item.name} (line {item.lineno})",
+        )
+        for item in layer.preserved_keys
+    )
+    tables = ", ".join(
+        _localized(
+            f"{header.name}（行 {header.lineno}）",
+            f"{header.name} (line {header.lineno})",
+        )
+        for header in layer.preserved_tables
+    )
+    none_text = _localized("无", "none")
+    _print(
+        _localized(
+            f"{sub}保留的未知/非受管标量键: {preserved or none_text}",
+            f"{sub}preserved unmanaged scalar keys: {preserved or 'none'}",
+        )
+    )
+    _print(
+        _localized(
+            f"{sub}保留的 TOML 表: {tables or none_text}（表内字段不读取、不改动）",
+            f"{sub}preserved TOML tables: {tables or 'none'} (table fields are "
+            "neither read nor modified)",
+        )
+    )
+    if layer.profile_files:
+        _print(
+            _localized(
+                f"{sub}同目录 profile 文件: {', '.join(layer.profile_files)}"
+                "（--profile 激活时可能遮蔽用户层该键；仅提示，不读取内容）",
+                f"{sub}profile files in this directory: {', '.join(layer.profile_files)}"
+                " (an active --profile may shadow the user-layer key; listed only, not read)",
+            )
+        )
+
+
+def print_instruction_discovery_layer(
+    layer: Optional[InstructionDiscoveryLayer],
+    indent: str = "    ",
+) -> None:
+    if layer is None:
+        return
+    sub = indent + "  "
+    states_zh = {
+        "present-nonempty": "存在且非空",
+        "present-empty": "存在但为空（运行时跳过）",
+        "missing": "不存在",
+        "unreadable": "存在但无法安全读取",
+    }
+    states_en = {
+        "present-nonempty": "present and non-empty",
+        "present-empty": "present but empty (skipped at runtime)",
+        "missing": "missing",
+        "unreadable": "present but unreadable",
+    }
+    if layer.supported is False:
+        support = _localized("该版本对全局 AGENTS.md 的支持未确认", "global AGENTS.md support is unverified for this version")
+    else:
+        support = _localized("该版本原生支持全局 AGENTS.md", "global AGENTS.md is natively supported by this version")
+    _print(
+        _localized(
+            f"{indent}指令发现层: AGENTS.md 原生发现机制（{support}）",
+            f"{indent}Instruction discovery layer: native AGENTS.md discovery ({support})",
+        )
+    )
+    _print(
+        _localized(
+            f"{sub}全局节点 {layer.global_agents}: {states_zh[layer.state]}",
+            f"{sub}global node {layer.global_agents}: {states_en[layer.state]}",
+        )
+    )
+    _print(
+        _localized(
+            f"{sub}语义: 全局与项目目录链 AGENTS.md 拼接进 developer 消息"
+            "（同键深层优先、空文件跳过）；它与 config.toml 文件指令是两个独立层，"
+            "不构成互斥覆盖；直接 developer/user 指令优先于 AGENTS.md。",
+            f"{sub}semantics: global and project-chain AGENTS.md files are "
+            "concatenated into the developer message (deeper files win on "
+            "conflict, empty files are skipped); this layer is independent from "
+            "the config.toml file instruction and does not override it; direct "
+            "developer/user instructions take precedence over AGENTS.md.",
+        )
+    )
+
+
 def resolve_bundled_prompt(preset: str) -> Tuple[str, str]:
     if preset == PRESET_OVERLAY:
         return BUILTIN_GPT_OVERLAY_MD, "examples/gpt-overlay.md"
@@ -15539,7 +16621,10 @@ def _print_node(label: str, node: NodeInfo) -> None:
     _print(f"    {label}: {node.kind} ({node.path})")
 
 
-def show_status(codex_dirs: List[str]) -> None:
+def show_status(
+    codex_dirs: List[str],
+    capability: Optional["ResolvedCapability"] = None,
+) -> None:
     """Print a read-only status report; hook files are never opened or parsed."""
     if not codex_dirs:
         _print(
@@ -15552,6 +16637,11 @@ def show_status(codex_dirs: List[str]) -> None:
 
     invalid_count = 0
     inactive_count = 0
+    # Status is strictly read-only: capability evidence is shown, but an
+    # unknown/unverifiable Codex version never changes the exit code or adds
+    # a blocker; it is only presented in the compatibility layer report.
+    if capability is None:
+        capability = resolve_capability(None, None)
     _print(f"[状态] 找到 {len(codex_dirs)} 个 Codex 配置目录（只读检查）:")
     for directory in codex_dirs:
         codex_root = Path(directory)
@@ -15571,6 +16661,8 @@ def show_status(codex_dirs: List[str]) -> None:
                 md_filename=status_md_filename,
                 skip_hooks_isolation=True,
                 status_mode=True,
+                capability=capability,
+                emit_capability_blocker=False,
             )
         except OSError as exc:
             invalid_count += 1
@@ -15618,6 +16710,9 @@ def show_status(codex_dirs: List[str]) -> None:
             "    model_instructions_file: "
             f"{plan.config_reference if plan.config_reference is not None else '<未设置或无法识别>'}"
         )
+        print_capability_report(capability)
+        print_runtime_config_layer(plan.runtime_layer, capability)
+        print_instruction_discovery_layer(plan.discovery_layer)
         preset_name = infer_instruction_preset(codex_root)
         _print(f"    preset: {preset_name}")
         config_text = ""
@@ -15871,6 +16966,15 @@ def _deploy_locked(args, codex_dirs: Optional[List[str]] = None) -> None:
         )
         sys.exit(1)
 
+    # Resolve the Codex version -> capability descriptor -> install strategy
+    # once for the whole batch. Unknown/unverifiable versions fail closed:
+    # every per-directory plan carries the blocker and no config key is
+    # rendered or written.
+    capability = resolve_capability(
+        getattr(args, "codex_version", None),
+        getattr(args, "codex_bin", None),
+    )
+
     prompt_sha256 = hashlib.sha256(md_content.encode("utf-8")).hexdigest()
     if args.file is None:
         _content, bundled_source = resolve_bundled_prompt(preset)
@@ -15947,6 +17051,7 @@ def _deploy_locked(args, codex_dirs: Optional[List[str]] = None) -> None:
             md_filename=md_filename,
             consider_legacy=consider_legacy,
             skip_hooks_isolation=skip_hooks_isolation,
+            capability=capability,
         )
         for directory in codex_dirs
     ]
@@ -15964,7 +17069,22 @@ def _deploy_locked(args, codex_dirs: Optional[List[str]] = None) -> None:
             md_dest = codex_root / md_filename
             _print(f"\n  目标: {codex_root}")
             _print(f"    → 写入 MD: {md_dest}")
-            _print(f"    → 配置项: model_instructions_file = \"./{md_filename}\"")
+            if capability.usable:
+                _print(
+                    f"    → 配置项: {plan.install_key} = "
+                    f'"{plan.install_reference}"'
+                )
+            else:
+                _print(
+                    _localized(
+                        "    → 配置项: 不写入任何指令配置键（兼容性阻断，见阻塞项）",
+                        "    → Config entry: no instruction config key will be "
+                        "written (compatibility blocked; see blocker)",
+                    )
+                )
+            print_capability_report(capability)
+            print_runtime_config_layer(plan.runtime_layer, capability)
+            print_instruction_discovery_layer(plan.discovery_layer)
             if plan.current.exists:
                 _print(
                     _localized(
@@ -16071,6 +17191,7 @@ def _deploy_locked(args, codex_dirs: Optional[List[str]] = None) -> None:
             md_filename=md_filename,
             consider_legacy=consider_legacy,
             skip_hooks_isolation=skip_hooks_isolation,
+            capability=capability,
         )
         for directory in codex_dirs
     ]
@@ -16288,11 +17409,17 @@ def _deploy_locked(args, codex_dirs: Optional[List[str]] = None) -> None:
                 )
                 _print(f"  [备份] config.toml → {state.config_backup.name}")
                 _print(
-                    "  [配置] 已设置 model_instructions_file = "
-                    f"\"./{md_filename}\""
+                    f"  [配置] 已设置 {plan.install_key} = "
+                    f'"{plan.install_reference}"'
                 )
             else:
-                _print("  [配置] model_instructions_file 已存在且值相同，跳过")
+                _print(
+                    _localized(
+                        f"  [配置] {plan.install_key} 已存在且值相同，跳过",
+                        f"  [Config] {plan.install_key} already has the "
+                        "requested value; skipped",
+                    )
+                )
 
         if not skip_hooks_isolation:
             for state in states:
@@ -17337,6 +18464,24 @@ Examples:
         ),
     )
     parser.add_argument(
+        "--codex-bin",
+        help=_localized(
+            "用于探测版本的 codex 可执行文件路径（默认查 PATH 上的 codex）",
+            "Path to the codex executable used for version probing "
+            "(defaults to codex on PATH)",
+        ),
+    )
+    parser.add_argument(
+        "--codex-version",
+        metavar="X.Y.Z",
+        help=_localized(
+            "显式指定 Codex 语义化版本作为能力判定证据（跳过可执行文件探测）；"
+            "未知版本将阻断部署",
+            "Explicit Codex semantic version used as capability evidence "
+            "(skips executable probing); unknown versions block deployment",
+        ),
+    )
+    parser.add_argument(
         "--target-dir",
         help="Explicit absolute project target for scenario status/write operations",
     )
@@ -17425,6 +18570,14 @@ Examples:
         )
     args.preset = explicit_preset or PRESET_OVERLAY
 
+    if args.codex_version is not None:
+        try:
+            parse_pinned_codex_version(args.codex_version)
+        except ValueError as exc:
+            parser.error(str(exc))
+    if args.codex_bin is not None and not args.codex_bin.strip():
+        parser.error("--codex-bin 不能为空 / --codex-bin must not be empty")
+
     scaffold_selectors = [
         bool(args.scaffold),
         bool(args.scaffold_list),
@@ -17455,6 +18608,8 @@ Examples:
             or args.scenario_recover
             or args.target_dir
             or args.scenario_root
+            or args.codex_bin
+            or args.codex_version
         ):
             parser.error(
                 "scaffold commands conflict with instruction and scenario options"
@@ -17482,6 +18637,8 @@ Examples:
             or args.codex_dir
             or args.skip_hooks_isolation
             or args.dry_run
+            or args.codex_bin
+            or args.codex_version
         ):
             parser.error(
                 "scenario commands conflict with instruction deployment options"
@@ -17521,6 +18678,17 @@ Examples:
 
     if args.target_dir or args.scenario_root:
         parser.error("--target-dir and --scenario-root require a scenario command")
+
+    if (args.restore_hooks or args.uninstall or args.recover) and (
+        args.codex_bin is not None or args.codex_version is not None
+    ):
+        parser.error(
+            _localized(
+                "--codex-bin/--codex-version 仅用于部署、dry-run、--status 与 --reactivate",
+                "--codex-bin/--codex-version are only accepted for deploy, "
+                "dry-run, --status, and --reactivate",
+            )
+        )
 
     if args.status and (
         hasattr(args, "file")
@@ -17637,7 +18805,10 @@ Examples:
             find_codex_dirs = lambda: [str(codex_root)]  # noqa: E731
 
     if args.status:
-        show_status(find_status_dirs())
+        status_capability = resolve_capability(
+            args.codex_version, args.codex_bin
+        )
+        show_status(find_status_dirs(), status_capability)
         return
 
     if args.uninstall:
@@ -17649,7 +18820,11 @@ Examples:
         return
 
     if args.reactivate:
-        reactivate(find_reactivate_dirs(), args.yes)
+        reactivate(
+            find_reactivate_dirs(),
+            args.yes,
+            resolve_capability(args.codex_version, args.codex_bin),
+        )
         return
 
     if args.restore_hooks:
